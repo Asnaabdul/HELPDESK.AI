@@ -12,3 +12,5 @@ google-genai
 pillow
 python-dotenv
 easyocr
+slowapi>=0.1.9
+supabase>=2.3.0

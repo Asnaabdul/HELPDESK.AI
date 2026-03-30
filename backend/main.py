@@ -7,6 +7,8 @@ GET  /health             →  service health check
 import os
 import sys
 import uuid
+import json
+import datetime
 import traceback
 import warnings
 from contextlib import asynccontextmanager
@@ -16,8 +18,12 @@ warnings.filterwarnings("ignore", message="'pin_memory'")
 
 # HF Rebuild Trigger: 2026-03-08-2030
 from fastapi import FastAPI, Depends, HTTPException, Request
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
+from supabase import create_client, Client
 from pathlib import Path
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -25,6 +31,15 @@ from dotenv import load_dotenv
 # Load environment variables from backend/.env
 env_path = Path(__file__).parent / '.env'
 load_dotenv(dotenv_path=env_path)
+
+# Initialize Supabase Client (Service Role for backend bypass)
+url = os.environ.get("SUPABASE_URL")
+key = os.environ.get("SUPABASE_SERVICE_KEY")
+if not url or not key:
+    print("[ERROR] SUPABASE_URL or SUPABASE_SERVICE_KEY not set in backend/.env")
+    supabase: Client = None
+else:
+    supabase: Client = create_client(url, key)
 
 # Ensure project root is on path for imports
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -43,6 +58,9 @@ class TicketRequest(BaseModel):
     text: str
     image_base64: str = ""
     image_text: str = "" # Keep for backward compatibility
+    user_id: str | None = None
+    company: str | None = None
+    image_url: str | None = None
     confidence_threshold: float = 0.20
     duplicate_sensitivity: float = 0.85
 
@@ -60,6 +78,8 @@ class EntityInfo(BaseModel):
 
 
 class TicketResponse(BaseModel):
+    id: int | None = None
+    ticket_id: str | None = None
     summary: str
     category: str
     subcategory: str
@@ -175,9 +195,19 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# Rate limiter — 10 AI requests per minute per IP (free tier protection)
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+# CORS — locked to production + local dev only
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://helpdeskaiv1.vercel.app",
+        "http://localhost:5173",
+        "http://localhost:3000",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -373,20 +403,20 @@ async def log_correction(raw_request: Request):
         "corrected_prediction": corrected_prediction,
         "changed_fields": changed_fields,
         "confidence": confidence,
-        "timestamp": __import__("datetime").datetime.utcnow().isoformat() + "Z"
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
     }
 
     try:
         if CORRECTIONS_LOG_PATH.exists() and CORRECTIONS_LOG_PATH.stat().st_size > 2:
             with open(CORRECTIONS_LOG_PATH, "r", encoding="utf-8") as f:
-                logs = __import__("json").load(f)
+                logs = json.load(f)
         else:
             logs = []
 
         logs.append(entry)
 
         with open(CORRECTIONS_LOG_PATH, "w", encoding="utf-8") as f:
-            __import__("json").dump(logs, f, indent=2)
+            json.dump(logs, f, indent=2)
 
         print(f"[CORRECTION SAVED] Ticket ID: {ticket_id} | Changed: {changed_fields}")
         return {"status": "saved", "changed_fields": changed_fields}
@@ -397,23 +427,31 @@ async def log_correction(raw_request: Request):
 
 
 # ---------------------------------------------------------------------------
-# Ticket Persistence Management Endpoints
+# Ticket operations (Now via Supabase)
 # ---------------------------------------------------------------------------
 @app.get("/tickets")
-async def list_tickets(user_id: str | None = None):
-    """Retrieve all tickets, optionally filtered by owner_id."""
-    if user_id:
-        return [t for t in TICKETS_DB if t.owner_id == user_id]
-    return TICKETS_DB
-
+async def get_tickets(company_id: str | None = None):
+    """Fetch persistent tickets from Supabase."""
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Database connection not initialized")
+    
+    query = supabase.table("tickets").select("*").order("created_at", desc=True)
+    if company_id:
+        query = query.eq("company_id", company_id)
+        
+    res = query.execute()
+    return res.data
 
 @app.get("/tickets/{ticket_id}")
-async def get_ticket(ticket_id: str):
-    """Retrieve a single ticket by its unique ID."""
-    for ticket in TICKETS_DB:
-        if str(ticket.ticket_id) == str(ticket_id):
-            return ticket
-    raise HTTPException(status_code=404, detail="Ticket not found")
+async def get_ticket_by_id(ticket_id: str):
+    """Fetch single persistent ticket."""
+    if not supabase:
+        raise HTTPException(status_code=500, detail="Database connection not initialized")
+    
+    res = supabase.table("tickets").select("*").eq("id", ticket_id).single().execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="Ticket not found")
+    return res.data
 
 
 @app.post("/tickets", response_model=TicketRecord)
@@ -448,6 +486,7 @@ async def update_ticket(ticket_id: str, updates: dict):
 # Main AI Analyzer endpoint
 # ---------------------------------------------------------------------------
 @app.post("/ai/analyze_ticket", response_model=TicketResponse)
+@limiter.limit("10/minute")
 async def analyze_ticket(request_body: TicketRequest, http_request: Request):
     """Analyze a support ticket and return classification, entities, and duplicate info."""
     text = request_body.text
@@ -500,11 +539,8 @@ async def analyze_ticket(request_body: TicketRequest, http_request: Request):
         if gemini_result.get("detected_problem"):
             text = f"{text} {gemini_result['detected_problem']}".strip()
 
-    # Summary: Generate a concise one-line summary using Gemini
-    summary = text[:100] + ("…" if len(text) > 100 else "") # Fallback
-    if gemini_service and gemini_service._initialized:
-        print("[AI] Generating one-line summary...")
-        summary = gemini_service.get_summary(text)
+    # Summary placeholder — will be generated ONCE after full pipeline runs
+    summary = text[:100] + ("…" if len(text) > 100 else "")  # Fallback until Gemini runs
 
     # --- Classification ---
     try:
@@ -599,7 +635,7 @@ async def analyze_ticket(request_body: TicketRequest, http_request: Request):
         try:
             if LOW_CONF_LOG_PATH.exists() and LOW_CONF_LOG_PATH.stat().st_size > 2:
                 with open(LOW_CONF_LOG_PATH, "r", encoding="utf-8") as f:
-                    low_conf_logs = __import__("json").load(f)
+                    low_conf_logs = json.load(f)
             else:
                 low_conf_logs = []
 
@@ -609,11 +645,11 @@ async def analyze_ticket(request_body: TicketRequest, http_request: Request):
                 "predicted_category": classification["category"],
                 "predicted_subcategory": classification["subcategory"],
                 "confidence": classification["confidence"],
-                "timestamp": __import__("datetime").datetime.utcnow().isoformat() + "Z"
+                "timestamp": datetime.datetime.utcnow().isoformat() + "Z"
             })
 
             with open(LOW_CONF_LOG_PATH, "w", encoding="utf-8") as f:
-                __import__("json").dump(low_conf_logs, f, indent=2)
+                json.dump(low_conf_logs, f, indent=2)
 
             print(f'[LOW CONFIDENCE LOGGED] Confidence: {classification["confidence"]:.2f}')
         except Exception as e:
@@ -626,17 +662,88 @@ async def analyze_ticket(request_body: TicketRequest, http_request: Request):
     except Exception:
         pass
 
-    # Generate a concise 1-2 line summary for the UI using AI
-    if gemini_service:
+    # Generate one-line summary via Gemini (single call — no duplicate)
+    print("[AI] Generating one-line summary...")
+    if gemini_service and gemini_service._initialized:
         summary = gemini_service.get_summary(text)
     else:
-        summary = text[:100] + "..." if len(text) > 100 else text
+        summary = text[:100] + "…" if len(text) > 100 else text
 
     if gemini_analysis.get("image_description") and "Image Report" not in summary:
         summary = f"Image Report: {summary}"
     
+    # --- SLA & Timestamps ---
+    # Convert priority to SLA hours based on B2B best practices
+    hours_map = {"Critical": 2, "High": 8, "Medium": 24, "Low": 72}
+    sla_hours = hours_map.get(classification["priority"], 72)
+    
+    # Python datetime handles ISO strings well
+    from datetime import datetime, timedelta
+    now_dt = datetime.utcnow()
+    sla_breach_dt = now_dt + timedelta(hours=sla_hours)
+    
+    # ---------------------------------------------------------------------------
+    # STEP 3: PERSIST TO SUPABASE (The Source of Truth)
+    # ---------------------------------------------------------------------------
+    final_ticket_id = None
+    if supabase:
+        try:
+            insert_data = {
+                "user_id": request_body.user_id,
+                "subject": summary,
+                "description": text, # Full context including extracts
+                "category": classification["category"],
+                "subcategory": classification["subcategory"],
+                "priority": classification["priority"],
+                "assigned_team": classification["assigned_team"],
+                "status": "pending_human" if not classification["auto_resolve"] else "auto_resolved",
+                "auto_resolve": classification["auto_resolve"],
+                "is_duplicate": dup_result["is_duplicate"],
+                "confidence": classification["confidence"],
+                "image_url": request_body.image_url or None,
+                "company": request_body.company or "System",
+                "sla_breach_at": sla_breach_dt.isoformat() + "Z",
+                "metadata": {
+                    "confidence": classification["confidence"],
+                    "entities": entities,
+                    "env_metadata": env_metadata,
+                    "decision_factors": decision_factors,
+                    "ocr_text": gemini_analysis.get("ocr_text", ""),
+                    "image_description": gemini_analysis.get("image_description", "")
+                },
+                "entities": entities,
+                "solution_steps": highlights if not classification["auto_resolve"] else highlights, # Use placeholder for now
+                "ocr_text": gemini_analysis.get("ocr_text", ""),
+                "needs_review": needs_review,
+                "routing_confidence": classification["confidence"]
+            }
+            
+            res = supabase.table("tickets").insert(insert_data).execute()
+            if res.data:
+                final_ticket_id = res.data[0]["id"]
+                print(f"[DB] Ticket created in Supabase with ID: {final_ticket_id}")
+                
+            # Optional: Add initial system message to chat table
+            if final_ticket_id:
+                msg = "Our AI has automatically categorized your issue and escalated it to the right team."
+                if classification["auto_resolve"]:
+                    msg = "Our AI has detected a known solution for this issue. See the resolution steps below."
+                
+                supabase.table("ticket_messages").insert({
+                    "ticket_id": final_ticket_id,
+                    "sender_id": None, # System
+                    "sender_name": "AI Assistant",
+                    "sender_role": "admin",
+                    "message": msg
+                }).execute()
+                
+        except Exception as db_err:
+            print(f"[DB ERROR] Failed to persist ticket: {db_err}")
+            traceback.print_exc()
+
     return TicketResponse(
-        ticket_id=ticket_id,
+        ticket_id=str(final_ticket_id) if final_ticket_id else str(uuid.uuid4()),
+        id=final_ticket_id, # Frontend expects id too
         summary=summary,
         text=text,
         category=classification["category"],

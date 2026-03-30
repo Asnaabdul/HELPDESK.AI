@@ -1,13 +1,17 @@
 <div align="center">
 
+
+
 # `H E L P D E S K . A I`
 **The Intelligent Standard for Enterprise IT Service Management**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue?style=for-the-badge)](https://opensource.org/licenses/MIT)
 [![Vercel Deployment](https://img.shields.io/badge/Production-Live-000000?style=for-the-badge&logo=vercel&logoColor=white)](https://helpdeskaiv1.vercel.app/)
-[![AI Backend](https://img.shields.io/badge/AI_Engine-Hugging_Face-FF8C00?style=for-the-badge&logo=huggingface&logoColor=black)](https://huggingface.co/spaces/ritesh19180/ai-helpdesk-api)
+[![Interactive Slides](https://img.shields.io/badge/Presentation-Interactive-10B981?style=for-the-badge&logo=googleslides&logoColor=white)](https://ritesh-1918.github.io/HELPDESK.AI/HELPDESK.AI%20Presentation.html)
 
---
+<br/>
+
+---
 
 ### ⚡ Eliminating the Manual Triage Bottleneck.
 *Helpdesk.ai uses deep-learning neural networks and 4-layer enterprise architecture to categorize, prioritize, and resolve IT issues in milliseconds.*
@@ -74,6 +78,17 @@ Using `sentence-transformers` and **Cosine Similarity**, the system prevents "Ti
 ### 4. Visionary OCR & Reasoning
 - **Intelligent OCR**: Built-in screenshot analysis to pull error codes from user-uploaded images via Tesseract.
 - **Gemini Reasoning**: Advanced LLM integration for generating human-like auto-resolutions and knowledge base summaries.
+
+### 🚀 Team Quick Start (Interns)
+If you are part of the development team, run the following command in PowerShell to set up your environment automatically:
+```powershell
+.\setup_workspace.ps1
+```
+This script will:
+1. Verify Node.js and Python installations.
+2. Install all Frontend dependencies (`npm install`).
+3. Create a Python virtual environment for the Backend and install all AI dependencies.
+4. Verify your `.env` configuration.
 
 ---
 
@@ -143,6 +158,4 @@ Navigate to `/backend` and refer to internal documentation for Python environmen
 <div align="center">
 
 Built with ❤️ by the **HELPDESK.AI Professional** Team. 
-*Driving the future of Intelligent Enterprise Support.*
-
-</div>
+*Driving the future of Intelligent Enterprise Support
